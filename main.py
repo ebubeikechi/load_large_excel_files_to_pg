@@ -100,8 +100,10 @@ def cmd_import(args) -> int:
 
     from excel_reader import get_columns
     st.selected_columns = None
-    if args.pk_separator:
+    if args.pk_separator is not None:            # "" is valid: no separator
         st.pk_separator = args.pk_separator
+    if args.pk_name:
+        st.pk_column_name = args.pk_name
     if args.pk:
         st.pk_columns = [c.strip() for c in args.pk.split(",") if c.strip()]
     if args.columns:
@@ -114,20 +116,22 @@ def cmd_import(args) -> int:
         except FatalError as e:
             console.print(f"[bold red]Could not read the header:[/] {e}")
             return 2
-        picked = pick_columns(cols, console, st.pk_separator)
+        picked = pick_columns(cols, console, st.pk_separator, st.pk_name_joiner,
+                              st.pk_column_name, st.pk_columns)
         if picked is None:
             console.print("[yellow]Cancelled - nothing was imported.[/]")
             return 2
         chosen, pk = picked
         if len(chosen) < len(cols):
             st.selected_columns = chosen
-        if pk != [cols[0]]:
-            st.pk_columns = pk
+        st.pk_columns = pk if pk != [cols[0]] else None
     if st.selected_columns:
         console.print(f"[bold]Columns selected:[/] {len(st.selected_columns)}")
     if st.pk_columns and len(st.pk_columns) > 1:
-        console.print(f"[bold]Primary key (composite):[/] {' + '.join(st.pk_columns)} -> column "
-                      f"'{'_'.join(st.pk_columns)}' (values joined with '{st.pk_separator}')")
+        col = st.pk_column_name or st.pk_name_joiner.join(st.pk_columns)
+        how = f"joined with '{st.pk_separator}'" if st.pk_separator else "joined with no separator"
+        console.print(f"[bold]Primary key (composite):[/] {' + '.join(st.pk_columns)} -> first "
+                      f"column '{col}' ({how})")
     else:
         console.print(f"[bold]Primary key:[/] {(st.pk_columns or ['first column'])[0]}")
     need = (st.selected_columns or []) + (st.pk_columns or [])
@@ -302,7 +306,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--columns", help="comma-separated column names to import (skips the popup)")
     sp.add_argument("--all-columns", action="store_true", help="import every column (skips the popup)")
     sp.add_argument("--pk", help="primary key column(s), comma-separated; several are concatenated in this order")
-    sp.add_argument("--pk-separator", help="separator for a composite key (default |)")
+    sp.add_argument("--pk-separator", help="text between composite key values ('' = none); "
+                    "default from config.py")
+    sp.add_argument("--pk-name", help="name of the combined key column (default: names joined)")
     common(sp); tuning(sp); sp.set_defaults(fn=cmd_import)
 
     sp = sub.add_parser("resume", help="resume an interrupted job")

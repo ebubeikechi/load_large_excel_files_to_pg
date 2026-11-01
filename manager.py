@@ -16,8 +16,9 @@ from rich.table import Table
 
 from checkpoint import (Meta, create_job, ensure_meta, get_job, get_sheets, next_job_id,
                         now, set_job_status, touch_job, write_local_checkpoint)
-from common import FatalError, fingerprint, fmt_duration, fmt_size, validate_table_name
-from config import REPORT_DIR, DbConfig, ImportSettings
+from common import (FatalError, fingerprint, fmt_duration, fmt_size, validate_identifier,
+                    validate_table_name)
+from config import AUTO_WORKERS_MAX, REPORT_DIR, DbConfig, ImportSettings
 from dashboard import Dashboard
 from db import check_connection, connect, qname
 from excel_reader import SUPPORTED, list_sheets
@@ -46,6 +47,7 @@ def _terminate(ex) -> None:
 
 def _prepare_new(conn, meta, db_cfg, st, path, table, log, console):
     validate_table_name(table)
+    validate_identifier(table + st.issues_suffix, "issues table name")
     names = list_sheets(path, st.engine)
     if not names:
         raise FatalError("The workbook contains no worksheets.")
@@ -102,9 +104,11 @@ def run_import(db_cfg: DbConfig, st: ImportSettings, file_path: str, table: str 
         table = job["table_name"]
         st.batch_size = job["batch_size"] or st.batch_size
         jset = job["settings"] or {}
-        st.selected_columns = jset.get("selected_columns")
-        st.pk_columns = jset.get("pk_columns")
-        st.pk_separator = jset.get("pk_separator", "|")
+        for key in ("selected_columns", "pk_columns", "pk_separator", "pk_name_joiner",
+                    "pk_column_name", "issues_suffix", "issues_include_duplicates",
+                    "isolate_db_errors", "schema_overrides"):
+            if key in jset:
+                setattr(st, key, jset[key])
         resumed = True
     else:
         path = Path(file_path).expanduser().resolve()
@@ -127,7 +131,7 @@ def run_import(db_cfg: DbConfig, st: ImportSettings, file_path: str, table: str 
 
     sheets = get_sheets(conn, meta, job_id)
     pending = [s for s in sheets if s["status"] != "completed"]
-    workers = st.workers or min(len(pending) or 1, 3)
+    workers = st.workers or min(len(pending) or 1, AUTO_WORKERS_MAX)
     workers = max(1, min(workers, len(pending) or 1))
     barrier = [s["sheet_name"] for s in pending[:workers]]
     log.info("Processing %d worksheet(s) with %d worker process(es)", len(pending), workers)
@@ -188,25 +192,41 @@ def run_import(db_cfg: DbConfig, st: ImportSettings, file_path: str, table: str 
         raise FatalError(f"{msg}\n  Committed data is safe. Fix the problem and run:  "
                          f"python main.py resume --job-id {job_id}")
 
-    return _finalize(conn, meta, db_cfg, job, sheets, t_run, done_start, resumed, path, log, console)
+    return _finalize(conn, meta, db_cfg, st, job, sheets, t_run, done_start, resumed, path,
+                     log, console)
 
 
-def _finalize(conn, meta, db_cfg, job, sheets, t_run, done_start, resumed, path, log, console):
+def _finalize(conn, meta, db_cfg, st, job, sheets, t_run, done_start, resumed, path, log,
+              console):
     job_id = job["job_id"]
+    info = (get_job(conn, meta, job_id) or {}).get("col_types") or {}
+    if not isinstance(info, dict):
+        info = {}
     dest = qname(conn, db_cfg.schema, job["table_name"])
-    db_count = conn.execute(f"SELECT count(*) FROM {dest} WHERE imported_at = %s",
-                            (job["imported_at"],)).fetchone()[0]
     inserted = sum(s["inserted"] for s in sheets)
-    verified = db_count == inserted
-    conn.execute(f"ANALYZE {dest}")
+    if st.verify_after_import:
+        db_count = conn.execute(f"SELECT count(*) FROM {dest} WHERE imported_at = %s",
+                                (job["imported_at"],)).fetchone()[0]
+        verified = db_count == inserted
+    else:
+        db_count, verified = None, True
+    if st.analyze_after_import:
+        conn.execute(f"ANALYZE {dest}")
     status = "completed" if verified else "verification_failed"
     set_job_status(conn, meta, job_id, status, None if verified else
                    f"DB holds {db_count} rows for this job but counters say {inserted}", True)
-    issues_file = _export_issues(conn, meta, job_id)
-    info = (get_job(conn, meta, job_id) or {}).get("col_types") or {}
-    pk_info = ({"columns": info.get("pk"), "column_name": info.get("pk_name"),
-                "separator": info.get("sep") if len(info.get("pk") or []) > 1 else None}
-               if isinstance(info, dict) else None)
+
+    issues_name, n_issues, issues_file = info.get("issues_table"), 0, None
+    if issues_name:
+        iq = qname(conn, db_cfg.schema, issues_name)
+        n_issues = conn.execute(f"SELECT count(*) FROM {iq} WHERE _job_id = %s",
+                                (job_id,)).fetchone()[0]
+        if n_issues:
+            issues_file = _export_issues(conn, iq, info["pk_name"], job_id)
+
+    pk_cols = info.get("pk") or []
+    pk_info = {"columns": pk_cols, "column_name": info.get("pk_name"),
+               "separator": info.get("sep") if len(pk_cols) > 1 else None}
     done_end = Dashboard.totals(sheets)[0]
     duration = time.time() - t_run
     rows_read = sum(s["rows_read"] for s in sheets)
@@ -214,6 +234,8 @@ def _finalize(conn, meta, db_cfg, job, sheets, t_run, done_start, resumed, path,
         "job_id": job_id, "workbook_filename": path.name, "workbook_path": str(path),
         "workbook_size_bytes": job["file_size"], "destination_database": db_cfg.name,
         "destination_table": f"{db_cfg.schema}.{job['table_name']}",
+        "issues_table": f"{db_cfg.schema}.{issues_name}" if issues_name else None,
+        "issues_logged_for_this_job": n_issues,
         "worksheets_processed": [{k: s[k] for k in (
             "sheet_name", "rows_read", "inserted", "dup_existing", "dup_workbook", "rejected",
             "blank")} for s in sheets],
@@ -223,7 +245,8 @@ def _finalize(conn, meta, db_cfg, job, sheets, t_run, done_start, resumed, path,
         "duplicates_within_workbook": sum(s["dup_workbook"] for s in sheets),
         "rejected": sum(s["rejected"] for s in sheets),
         "blank_rows_skipped": sum(s["blank"] for s in sheets),
-        "primary_key": pk_info, "verified_rows_in_database": db_count, "verification_passed": verified,
+        "primary_key": pk_info, "verified_rows_in_database": db_count,
+        "verification_passed": verified,
         "start_time": job["started_at"].isoformat(), "completion_time": now().isoformat(),
         "duration_seconds": round(duration, 2),
         "average_rows_per_second": round((done_end - done_start) / duration, 1) if duration else 0,
@@ -244,14 +267,12 @@ def _finalize(conn, meta, db_cfg, job, sheets, t_run, done_start, resumed, path,
     return report
 
 
-def _export_issues(conn, meta, job_id):
-    n = conn.execute(f"SELECT count(*) FROM {meta.issues} WHERE job_id = %s", (job_id,)).fetchone()[0]
-    if not n:
-        return None
+def _export_issues(conn, issues_q: str, pk_name: str, job_id: str):
     path = REPORT_DIR / f"issues_{job_id}.csv"
-    q = sql.SQL("COPY (SELECT sheet_name, row_num, row_id, kind, reason FROM {t} "
-                "WHERE job_id = {j} ORDER BY sheet_name, row_num) TO STDOUT WITH (FORMAT CSV, HEADER)"
-                ).format(t=sql.SQL(meta.issues), j=sql.Literal(job_id))
+    q = sql.SQL("COPY (SELECT source_sheet, _source_row, {pk} AS primary_key, _issue_kind, "
+                "_issue_reason FROM {t} WHERE _job_id = {j} ORDER BY source_sheet, _source_row) "
+                "TO STDOUT WITH (FORMAT CSV, HEADER)").format(
+        pk=sql.Identifier(pk_name), t=sql.SQL(issues_q), j=sql.Literal(job_id))
     with open(path, "wb") as f, conn.cursor() as cur:
         with cur.copy(q) as cp:
             for data in cp:
@@ -270,7 +291,11 @@ def print_summary(console, r: dict, rpath) -> None:
               f"{r['duplicates_within_workbook']:,})")
     t.add_row("Rejected", f"{r['rejected']:,}")
     t.add_row("Blank rows skipped", f"{r['blank_rows_skipped']:,}")
-    t.add_row("Verified in database", f"{r['verified_rows_in_database']:,}")
+    vr = r["verified_rows_in_database"]
+    t.add_row("Verified in database", f"{vr:,}" if vr is not None else "skipped (config)")
+    if r.get("issues_table"):
+        t.add_row("Rows in issues table (this job)", f"{r['issues_logged_for_this_job']:,}")
+        t.add_row("Issues table", r["issues_table"])
     if r.get("primary_key") and r["primary_key"].get("column_name"):
         t.add_row("Primary key", r["primary_key"]["column_name"])
     t.add_row("Destination", r["destination_table"])
@@ -278,7 +303,7 @@ def print_summary(console, r: dict, rpath) -> None:
     t.add_row("Average speed", f"{r['average_rows_per_second']:,.0f} rows/sec")
     t.add_row("Report", str(rpath))
     if r.get("issues_file"):
-        t.add_row("Rejected/duplicate detail", r["issues_file"])
+        t.add_row("Issues summary (CSV)", r["issues_file"])
     console.print(Panel(t, title="[bold green]IMPORT COMPLETED SUCCESSFULLY" if ok
                         else "[bold red]IMPORT FINISHED - VERIFICATION FAILED",
                         border_style="green" if ok else "red"))

@@ -4,16 +4,17 @@ import time
 from collections import deque
 from itertools import chain, islice
 
-from checkpoint import (Meta, get_job, get_sheets, set_job_schema, set_sheet_status)
+from checkpoint import Meta, get_job, get_sheets, set_job_schema, set_sheet_status
 from common import FatalError
 from config import DbConfig, ImportSettings
 from db import connect
 from excel_reader import open_sheet
 from loader import BatchLoader
 from logger import get_logger
-from schema import create_table, infer_types, table_exists, verify_existing_table
+from schema import (create_table, ensure_issues_table, infer_types, table_exists,
+                    verify_existing_table)
 from validator import (EMPTY, RowConverter, RowError, compare_headers, normalize_header,
-                       pk_column_name, validate_header_names, validate_pk_name)
+                       table_columns, validate_header_names, validate_pk_name)
 
 ABORT_JOB_STATES = ("failed", "interrupted")
 
@@ -24,7 +25,7 @@ def run_sheet(task: dict) -> dict:
     st = ImportSettings(**task["settings"])
     job_id, sheet = task["job_id"], task["sheet"]
     log = get_logger(job_id)
-    conn = loader = None
+    conn = None
     try:
         conn = connect(cfg)
         meta = Meta(conn, cfg.schema)
@@ -104,9 +105,10 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
         else:
             sample = list(islice(stream.rows, st.sample_rows))
             selected, pk_cols = _resolve_selection(header, st.selected_columns, st.pk_columns)
-            pk_name = validate_pk_name(pk_cols, header)
+            pk_name = validate_pk_name(pk_cols, header, st.pk_name_joiner, st.pk_column_name)
             combined = len(pk_cols) > 1
-            table_cols = selected + ([pk_name] if combined else [])
+            table_cols = table_columns(selected, pk_cols, pk_name)
+            issues_name = task["table"] + st.issues_suffix
             pos = [header.index(c) for c in selected]
             sample_sel = [[r[i] if i < len(r) else None for i in pos] for r in sample]
             if table_exists(conn, cfg.schema, task["table"]):
@@ -116,27 +118,30 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
             else:
                 kinds_sel = infer_types(selected, sample_sel, st.schema_overrides,
                                         set() if combined else {pk_cols[0]})
-                kinds_full = kinds_sel + (["TEXT"] if combined else [])
+                kind_of = dict(zip(selected, kinds_sel))
+                if combined:
+                    kind_of[pk_name] = "TEXT"
+                kinds_full = [kind_of[c] for c in table_cols]
                 create_table(conn, cfg.schema, task["table"], table_cols, kinds_full, pk_name)
                 log.info("Created table %s.%s with types %s", cfg.schema, task["table"],
                          dict(zip(table_cols, kinds_full)))
-            log.info("Importing %d of %d columns; primary key column '%s' from %s (sep '%s')",
-                     len(selected), len(header), pk_name, pk_cols, st.pk_separator)
-            set_job_schema(conn, meta, job_id, header, selected, kinds_full, pk_cols, pk_name,
-                           st.pk_separator)
+            ensure_issues_table(conn, cfg.schema, issues_name, table_cols)
+            log.info("Issues table %s.%s ready. Importing %d of %d columns; primary key column "
+                     "'%s' from %s (separator %r)", cfg.schema, issues_name, len(selected),
+                     len(header), pk_name, pk_cols, st.pk_separator)
+            set_job_schema(conn, meta, job_id, header, {
+                "selected": selected, "table_cols": table_cols, "kinds": kinds_full,
+                "pk": pk_cols, "pk_name": pk_name, "sep": st.pk_separator,
+                "issues_table": issues_name})
             job = get_job(conn, meta, job_id)
     ref, info = job["header"], job["col_types"]
-    if isinstance(info, list):                # jobs created by older versions
-        selected, kinds_full = ref, info
-        pk_cols, sep = [ref[0]], "|"
-    else:
-        selected, kinds_full = info["selected"], info["kinds"]
-        pk_cols, sep = info.get("pk") or [selected[0]], info.get("sep", "|")
-    pk_name = info.get("pk_name") if isinstance(info, dict) and info.get("pk_name") \
-        else pk_column_name(pk_cols)
-    combined = len(pk_cols) > 1
-    table_cols = selected + ([pk_name] if combined else [])
-    kinds_sel = kinds_full[:len(selected)]
+    if not isinstance(info, dict) or "table_cols" not in info:
+        raise FatalError("This job was created by an older version of Excel2Postgres. "
+                         "Start a new import instead of resuming it.")
+    selected, table_cols, kinds_full = info["selected"], info["table_cols"], info["kinds"]
+    pk_cols, pk_name, sep, issues_name = info["pk"], info["pk_name"], info["sep"], info["issues_table"]
+    kind_of = dict(zip(table_cols, kinds_full))
+    kinds_sel = [kind_of[c] for c in selected]
     compare_headers(ref, header, sheet)
     log.info("Worksheet '%s': header validated (%d columns, %d imported)", sheet, len(header),
              len(selected))
@@ -162,13 +167,12 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
     else:
         resume_last, start_row = 0, stream.first_row + 1
 
-    used = conn.execute(f"SELECT count(*) FROM {meta.issues} WHERE job_id = %s AND sheet_name = %s",
-                        (job_id, sheet)).fetchone()[0]
-    loader = BatchLoader(cfg, meta, job, table_cols, kinds_full, log,
-                         max(st.max_issue_rows - used, 0), pk_name)
+    loader = BatchLoader(cfg, meta, job, table_cols, kinds_full, log, pk_name, issues_name,
+                         st.issues_include_duplicates, st.isolate_db_errors)
     try:
-        _import_rows(loader, task, st, RowConverter(selected, kinds_sel, indices, len(header), pk_cols, sep), rows, start_row,
-                     resume_last, me["rejected"], log)
+        _import_rows(loader, task, st, RowConverter(selected, kinds_sel, indices, len(header),
+                                                    pk_cols, sep),
+                     rows, start_row, resume_last, me["rejected"], log)
     finally:
         loader.close()
         stream.close()
@@ -178,8 +182,8 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
 
 
 def _import_rows(loader, task, st, conv, rows, start_row, prev_last, rejected_total, log):
-    job_id, sheet, batch_size = task["job_id"], task["sheet"], st.batch_size
-    convert = conv.convert
+    sheet, batch_size = task["sheet"], st.batch_size
+    convert, include_dups = conv.convert, st.issues_include_duplicates
     good, issues, seen = [], [], {}
     n = blank = rejected = dup_batch = 0
     row_num = start_row - 1
@@ -191,19 +195,21 @@ def _import_rows(loader, task, st, conv, rows, start_row, prev_last, rejected_to
         res = loader.commit(sheet, prev_last, row_num, good, issues, n - blank, blank,
                             rejected, dup_batch)
         dt = time.perf_counter() - t_batch
+        failed = 0
         if res is not None:
-            log.info("COMMIT '%s' rows %d-%d | inserted=%d dup=%d rejected=%d blank=%d | "
-                     "%.0f rows/s", sheet, prev_last + 1, row_num, res["inserted"],
-                     res["dup_existing"] + res["dup_workbook"], rejected, blank,
+            failed = res["failed"]
+            log.info("COMMIT '%s' rows %d-%d | inserted=%d dup=%d rejected=%d db_errors=%d "
+                     "blank=%d | %.0f rows/s", sheet, prev_last + 1, row_num, res["inserted"],
+                     res["dup_existing"] + res["dup_workbook"], rejected, failed, blank,
                      n / dt if dt else 0)
-        rejected_total += rejected
+        rejected_total += rejected + failed
         prev_last = row_num
         good, issues, seen = [], [], {}
         n = blank = rejected = dup_batch = 0
         t_batch = time.perf_counter()
         if st.max_rejects >= 0 and rejected_total > st.max_rejects:
-            raise FatalError(f"Rejected rows ({rejected_total}) exceed --max-rejects "
-                             f"{st.max_rejects}; stopped. See import_issues for details.")
+            raise FatalError(f"Rejected rows ({rejected_total}) exceed MAX_REJECTS "
+                             f"{st.max_rejects}; stopped. See the issues table for details.")
 
     for row in rows:
         row_num += 1
@@ -222,16 +228,16 @@ def _import_rows(loader, task, st, conv, rows, start_row, prev_last, rejected_to
                 if rejected <= 20:
                     log.warning("REJECT sheet='%s' row=%d id=%s reason=%s", sheet, row_num,
                                 conv.id_text(row), e)
-                if loader.take_budget():
-                    issues.append((job_id, sheet, row_num, conv.id_text(row), "REJECTED", str(e)))
+                issues.append((row_num, "REJECTED", str(e), conv.issue_values(row)))
             else:
-                key = vals[conv.key_index]
+                key = vals[0]
                 first = seen.get(key)
                 if first is not None:
                     dup_batch += 1
-                    if loader.take_budget():
-                        issues.append((job_id, sheet, row_num, str(key)[:200], "DUPLICATE",
-                                       f"id repeated within batch (first seen at row {first})"))
+                    if include_dups:
+                        issues.append((row_num, "DUPLICATE_IN_WORKBOOK",
+                                       f"primary key repeated within batch (first seen at row "
+                                       f"{first})", conv.vals_text(vals)))
                 else:
                     seen[key] = row_num
                     vals.append(row_num)

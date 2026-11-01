@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 
-def pick_columns(columns: list[str], console=None, sep: str = "|"):
+def pick_columns(columns: list[str], console=None, sep: str = "|", joiner: str = "_",
+                 pk_name: str = "", default_pk: list[str] | None = None):
     """Returns (selected_columns_in_header_order, primary_key_columns_in_click_order),
     or None if cancelled."""
     try:
-        return _gui(columns, sep)
+        return _gui(columns, sep, joiner, pk_name, default_pk)
     except Exception:       # no display / tkinter missing -> terminal prompt
         return _terminal(columns, console)
 
 
-def _gui(columns: list[str], sep: str):
+def _gui(columns: list[str], sep: str, joiner: str, pk_name: str, default_pk):
     import tkinter as tk
     from tkinter import messagebox, ttk
 
@@ -30,8 +31,9 @@ def _gui(columns: list[str], sep: str):
                    "tick them and stored in one combined key column.").pack(fill="x")
 
     sel = [tk.BooleanVar(value=True) for _ in columns]
-    pk_vars = [tk.BooleanVar(value=(i == 0)) for i in range(n)]
-    pk_order: list[int] = [0]
+    start = [columns.index(c) for c in (default_pk or []) if c in columns] or [0]
+    pk_vars = [tk.BooleanVar(value=(i in start)) for i in range(n)]
+    pk_order: list[int] = list(start)
     master = tk.BooleanVar(value=True)
     count = ttk.Label(root, padding=(12, 0))
     pk_lbl = ttk.Label(root, padding=(12, 4), wraplength=640, justify="left",
@@ -51,8 +53,10 @@ def _gui(columns: list[str], sep: str):
         elif len(names) == 1:
             pk_lbl.config(text=f"Primary key: {names[0]}")
         else:
-            pk_lbl.config(text=f"Primary key (composite): column '{'_'.join(names)}'  =  "
-                               f"{(' ' + sep + ' ').join(names)}")
+            col = pk_name or joiner.join(names)
+            how = f"joined with '{sep}'" if sep else "joined with no separator"
+            pk_lbl.config(text=f"Primary key (composite): new first column '{col}' = "
+                               f"{' + '.join(names)}  ({how})")
 
     def on_item(i):
         if sel[i].get():

@@ -33,8 +33,10 @@ def connect(cfg: DbConfig, tune: bool = True) -> psycopg.Connection:
     """Autocommit connection; real transactions are opened with `conn.transaction()`."""
     conn = psycopg.connect(cfg.conninfo(), autocommit=True, connect_timeout=10)
     if tune:
-        conn.execute("SET synchronous_commit = off")   # big win; crash-safe because the
-        conn.execute("SET temp_buffers = '128MB'")     # checkpoint commits with the data
+        import config
+        if config.SYNCHRONOUS_COMMIT_OFF:              # safe: checkpoint commits with the data
+            conn.execute("SET synchronous_commit = off")
+        conn.execute("SET temp_buffers = '128MB'")
     return conn
 
 

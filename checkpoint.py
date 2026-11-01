@@ -18,7 +18,6 @@ class Meta:
         self.schema = schema
         self.jobs = qname(conn, schema, "import_jobs")
         self.sheets = qname(conn, schema, "import_job_sheets")
-        self.issues = qname(conn, schema, "import_issues")
 
 
 def ensure_meta(conn, meta: Meta) -> None:
@@ -36,10 +35,6 @@ def ensure_meta(conn, meta: Meta) -> None:
         dup_workbook BIGINT NOT NULL DEFAULT 0, rejected BIGINT NOT NULL DEFAULT 0,
         blank BIGINT NOT NULL DEFAULT 0, error TEXT, finished_at TIMESTAMPTZ,
         PRIMARY KEY (job_id, sheet_name))""")
-    conn.execute(f"""CREATE TABLE IF NOT EXISTS {meta.issues} (
-        job_id TEXT NOT NULL, sheet_name TEXT NOT NULL, row_num BIGINT,
-        row_id TEXT, kind TEXT NOT NULL, reason TEXT)""")
-    conn.execute(f"CREATE INDEX IF NOT EXISTS import_issues_job_idx ON {meta.issues} (job_id)")
 
 
 def now() -> datetime:
@@ -97,11 +92,9 @@ def touch_job(conn, meta: Meta, job_id: str) -> None:
     conn.execute(f"UPDATE {meta.jobs} SET updated_at = now() WHERE job_id = %s", (job_id,))
 
 
-def set_job_schema(conn, meta: Meta, job_id: str, header: list[str], selected: list[str],
-                   kinds: list[str], pk_cols: list[str], pk_name: str, sep: str) -> None:
-    """header = full reference header (validation); selected = imported source columns;
-    kinds = types of the TABLE columns (selected + combined key column, if any)."""
-    info = {"selected": selected, "kinds": kinds, "pk": pk_cols, "pk_name": pk_name, "sep": sep}
+def set_job_schema(conn, meta: Meta, job_id: str, header: list[str], info: dict) -> None:
+    """header = full reference header (validation). info = table layout:
+    selected, table_cols, kinds, pk, pk_name, sep, issues_table."""
     conn.execute(f"UPDATE {meta.jobs} SET header = %s, col_types = %s WHERE job_id = %s",
                  (Jsonb(header), Jsonb(info), job_id))
 

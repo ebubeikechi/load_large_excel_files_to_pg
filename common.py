@@ -12,6 +12,7 @@ class FatalError(Exception):
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 META_TABLES = {"import_jobs", "import_job_sheets", "import_issues"}
 METADATA_COLUMNS = ("source_sheet", "imported_at")
+ISSUE_COLUMNS = ("_source_row", "_job_id", "_issue_kind", "_issue_reason")
 
 
 def validate_identifier(name: str, what: str) -> str:

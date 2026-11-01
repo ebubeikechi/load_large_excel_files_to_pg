@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
-from common import FatalError, METADATA_COLUMNS
+from common import FatalError, ISSUE_COLUMNS, METADATA_COLUMNS
 
 EMPTY = frozenset((None, ""))
 INT64 = 2 ** 63 - 1
@@ -139,6 +139,33 @@ CONVERTERS = {"TEXT": _text, "NUMERIC": _numeric, "BIGINT": _bigint, "DATE": _da
               "TIMESTAMP": _timestamp, "BOOLEAN": _bool, "TIME": _time, "INTERVAL": _interval}
 
 
+def issue_text(v):
+    """Text form of ANY cell/converted value for the issues table. Never raises. The only
+    change made is dropping NUL characters, which PostgreSQL cannot store."""
+    if v is None or v == "":
+        return None
+    c = v.__class__
+    if c is str:
+        out = v
+    elif c is bool:
+        return "true" if v else "false"
+    elif c is float:
+        if v != v or v in (_INF, -_INF):
+            return str(v)
+        out = str(int(v)) if v.is_integer() and abs(v) < 1e15 else repr(v)
+    elif isinstance(v, (datetime, date, time)):
+        out = v.isoformat()
+    else:
+        out = str(v)
+    if "\x00" in out:
+        out = out.replace("\x00", "")
+    try:
+        out.encode("utf-8")
+    except UnicodeEncodeError:
+        out = out.encode("utf-8", "replace").decode("utf-8")
+    return out
+
+
 def _id_wrapper(conv):
     def wrapped(v):
         if v is None or (v.__class__ is str and not v.strip()):
@@ -149,10 +176,11 @@ def _id_wrapper(conv):
 
 class RowConverter:
     """Validates + converts one source row into a list aligned with the TABLE columns:
-    the imported (selected) columns, plus - for a composite primary key - one extra combined
-    key column holding the pk values joined by `sep` in pk order.
-    header/kinds: imported columns. indices: their positions in the full source row.
-    full_width: number of columns in the source header. pk: primary-key column names."""
+    the primary-key column FIRST (for a composite key: the combined value), then the other
+    imported columns in header order.
+    header/kinds: imported (selected) columns. indices: their positions in the full source
+    row. full_width: columns in the source header. pk: primary-key column names. sep: text
+    placed between composite key values ("" = none)."""
 
     def __init__(self, header: list[str], kinds: list[str], indices: list[int] | None = None,
                  full_width: int | None = None, pk: list[str] | None = None, sep: str = "|"):
@@ -162,11 +190,21 @@ class RowConverter:
         pk = pk or [header[0]]
         self.pk_pos = [header.index(c) for c in pk]
         self.combined = len(pk) > 1
-        if self.combined:
-            self.key_index = len(header)          # the appended combined column
-        else:
-            self.key_index = self.pk_pos[0]
-            self.convs[self.key_index] = _id_wrapper(self.convs[self.key_index])
+        self.key_index = 0                         # the key is always the first output value
+        self.perm = None
+        if not self.combined:
+            p = self.pk_pos[0]
+            self.convs[p] = _id_wrapper(self.convs[p])
+            if p != 0:
+                self.perm = [p] + [i for i in range(len(header)) if i != p]
+
+    def _fit(self, row):
+        n, ncols = len(row), self.ncols
+        if n > ncols:
+            row = row[:ncols]
+        elif n < ncols:
+            row = list(row) + [None] * (ncols - n)
+        return [row[i] for i in self.indices] if self.indices is not None else row
 
     def convert(self, row) -> list:
         n = len(row)
@@ -196,11 +234,29 @@ class RowConverter:
                 if p is None or not p.strip():
                     raise RowError(f"missing primary key part '{self.header[i]}'")
                 parts.append(p)
-            vals.append(self.sep.join(parts))
+            return [self.sep.join(parts)] + vals
+        if self.perm is not None:
+            return [vals[i] for i in self.perm]
         return vals
 
+    def issue_values(self, row) -> list:
+        """Raw cell values of a REJECTED row as text, aligned with the table columns."""
+        try:
+            vals = [issue_text(v) for v in self._fit(row)]
+            if self.combined:
+                parts = [vals[i] for i in self.pk_pos]
+                key = self.sep.join(parts) if all(p and p.strip() for p in parts) else None
+                return [key] + vals
+            return [vals[i] for i in self.perm] if self.perm else vals
+        except Exception:
+            return [None] * (len(self.header) + (1 if self.combined else 0))
+
+    @staticmethod
+    def vals_text(vals) -> list:
+        return [issue_text(v) for v in vals]
+
     def id_text(self, row) -> str | None:
-        """Best-effort identifier of a source row (for issue logs); never raises."""
+        """Best-effort identifier of a source row (for logs); never raises."""
         try:
             pos = [self.indices[i] for i in self.pk_pos] if self.indices is not None else self.pk_pos
             return self.sep.join("" if row[p] is None else str(row[p]) for p in pos)[:200]
@@ -266,7 +322,7 @@ def validate_header_names(header: list[str]) -> None:
     for h in header:
         if len(h.encode("utf-8")) > 63:
             raise FatalError(f"Column name too long for PostgreSQL (63 bytes max): '{h}'")
-        if h.lower() in METADATA_COLUMNS:
+        if h.lower() in METADATA_COLUMNS + ISSUE_COLUMNS:
             raise FatalError(f"Column name '{h}' collides with a reserved metadata column.")
 
 
@@ -282,20 +338,29 @@ def compare_headers(ref: list[str], header: list[str], sheet: str) -> None:
     raise FatalError(f"Worksheet '{sheet}' header differs from the reference header: {detail}")
 
 
-def pk_column_name(pk_cols: list[str]) -> str:
-    """Single pk -> that column. Several -> names joined by '_' in concatenation order."""
-    return pk_cols[0] if len(pk_cols) == 1 else "_".join(pk_cols)
+def pk_column_name(pk_cols: list[str], joiner: str = "_", override: str = "") -> str:
+    """Single pk -> that column. Several -> override, else names joined in concatenation order."""
+    return pk_cols[0] if len(pk_cols) == 1 else (override or joiner.join(pk_cols))
 
 
-def validate_pk_name(pk_cols: list[str], header: list[str]) -> str:
-    name = pk_column_name(pk_cols)
+def validate_pk_name(pk_cols: list[str], header: list[str], joiner: str = "_",
+                     override: str = "") -> str:
+    name = pk_column_name(pk_cols, joiner, override)
     if len(pk_cols) > 1:
         if name in header:
             raise FatalError(f"The combined primary key column name '{name}' collides with an "
                              f"existing column.")
         if len(name.encode("utf-8")) > 63:
             raise FatalError(f"The combined primary key column name is {len(name.encode('utf-8'))}"
-                             f" bytes (PostgreSQL max 63). Choose fewer or shorter key columns.")
-        if name.lower() in METADATA_COLUMNS:
-            raise FatalError(f"'{name}' is a reserved metadata column name.")
+                             f" bytes (PostgreSQL max 63). Choose fewer/shorter key columns or "
+                             f"set PK_COLUMN_NAME in config.py.")
+        if name.lower() in METADATA_COLUMNS + ISSUE_COLUMNS:
+            raise FatalError(f"'{name}' is a reserved column name.")
     return name
+
+
+def table_columns(selected: list[str], pk_cols: list[str], pk_name: str) -> list[str]:
+    """Column order of the destination table: the primary key ALWAYS comes first."""
+    if len(pk_cols) > 1:
+        return [pk_name] + list(selected)
+    return [pk_name] + [c for c in selected if c != pk_name]

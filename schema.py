@@ -6,15 +6,10 @@ from datetime import date, datetime, time, timedelta
 import psycopg
 from psycopg import sql
 
+import config
 from common import FatalError
 
 KINDS = ("TEXT", "NUMERIC", "BIGINT", "DATE", "TIMESTAMP", "BOOLEAN", "TIME", "INTERVAL")
-
-# Numeric-looking columns whose LAST name token is one of these are identifiers
-# (references, account numbers, phone numbers ...) and are kept as TEXT.
-ID_TOKENS = {"id", "ref", "reference", "no", "num", "number", "code", "acct", "account",
-             "phone", "tel", "mobile", "msisdn", "zip", "postal", "stan", "rrn", "pan",
-             "bin", "tin", "bvn", "nuban", "iban", "sku", "uuid", "guid", "cheque"}
 
 _PG_TO_KIND = {
     "text": "TEXT", "character varying": "TEXT", "character": "TEXT", "citext": "TEXT",
@@ -29,7 +24,7 @@ _PG_TO_KIND = {
 def looks_like_identifier(name: str) -> bool:
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
     tokens = [t for t in re.split(r"[^a-z0-9]+", spaced.lower()) if t]
-    return bool(tokens) and tokens[-1] in ID_TOKENS
+    return bool(tokens) and tokens[-1] in {t.lower() for t in config.TEXT_COLUMN_NAME_TOKENS}
 
 
 def infer_types(header: list[str], sample_rows, overrides: dict | None = None,
@@ -128,3 +123,24 @@ def verify_existing_table(conn, schema: str, table: str, header: list[str],
             raise FatalError(f"Column '{h}' has unsupported PostgreSQL type '{cols[h][1]}'.")
         kinds.append(k)
     return kinds
+
+
+def ensure_issues_table(conn, schema: str, issues_name: str, table_cols: list[str]) -> None:
+    """Creates (or extends) '<table>_issues': same columns as the main table but ALL TEXT, no
+    PRIMARY KEY / NOT NULL / CHECK - so a row can be stored whatever its failure reason."""
+    ident = sql.Identifier
+    meta_cols = [("source_sheet", "TEXT"), ("imported_at", "TIMESTAMPTZ"),
+                 ("_source_row", "BIGINT"), ("_job_id", "TEXT"), ("_issue_kind", "TEXT"),
+                 ("_issue_reason", "TEXT")]
+    wanted = [(c, "TEXT") for c in table_cols] + meta_cols
+    if not table_exists(conn, schema, issues_name):
+        defs = sql.SQL(", ").join(sql.SQL("{} {}").format(ident(c), sql.SQL(k)) for c, k in wanted)
+        conn.execute(sql.SQL("CREATE TABLE {} ({})").format(ident(schema, issues_name), defs))
+        return
+    have = {r[0] for r in conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = %s "
+        "AND table_name = %s", (schema, issues_name)).fetchall()}
+    for c, k in wanted:
+        if c not in have:
+            conn.execute(sql.SQL("ALTER TABLE {} ADD COLUMN {} {}").format(
+                ident(schema, issues_name), ident(c), sql.SQL(k)))

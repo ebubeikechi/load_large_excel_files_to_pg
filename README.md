@@ -75,3 +75,22 @@ maintenance_work_mem = 1GB
 
 ## Tests
 `pytest -q` (DB tests use your `.env` database and clean up their own tables).
+
+## Primary key layout
+The primary-key column is ALWAYS the first column of the table. One key column -> that column is
+moved first. Several -> a new first column holds their values joined by `PK_SEPARATOR` (empty =
+plain concatenation) and is named from the key columns joined by `PK_NAME_JOINER` (or
+`PK_COLUMN_NAME`). The original columns stay in the table if you imported them.
+
+## Issues table  (`<table>_issues`)
+Created next to the main table. Same columns (key first) but every one is TEXT with no
+constraints, plus `source_sheet, imported_at, _source_row, _job_id, _issue_kind, _issue_reason`.
+Kinds: `REJECTED` (failed validation, raw values kept), `DUPLICATE_IN_WORKBOOK`,
+`DUPLICATE_EXISTING`, `DB_ERROR` (PostgreSQL refused the row, e.g. value too large for an
+existing NUMERIC(5,2) column - the good rows of that batch are still loaded).
+Find them with `SELECT * FROM my_table_issues WHERE _job_id = '...'`.
+
+## Configuration
+Open `config.py` and edit the USER SETTINGS block (separator, key name rules, default key
+columns, issues-table behaviour, batch size, workers, type rules, verification...).
+Priority: command-line flag > `.env` value (same NAME) > value in `config.py`.
