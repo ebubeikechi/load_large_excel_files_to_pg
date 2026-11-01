@@ -52,6 +52,17 @@ def _mark_failed(cfg, task, msg):
         pass
 
 
+def _resolve_selection(header: list[str], wanted) -> list[str]:
+    """Selected column names in header order; the first column (primary key) is always kept."""
+    if not wanted:
+        return list(header)
+    missing = [c for c in wanted if c not in header]
+    if missing:
+        raise FatalError(f"Selected column(s) not found in the worksheet header: {missing[:5]}")
+    keep = set(wanted) | {header[0]}
+    return [h for h in header if h in keep]
+
+
 def _wait(conn, meta, job_id, predicate, sleep=0.5):
     while True:
         job = get_job(conn, meta, job_id)
@@ -91,19 +102,29 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
             job = _wait(conn, meta, job_id, lambda j, s: j["header"] is not None)
         else:
             sample = list(islice(stream.rows, st.sample_rows))
+            selected = _resolve_selection(header, st.selected_columns)
+            pos = [header.index(c) for c in selected]
+            sample_sel = [[r[i] if i < len(r) else None for i in pos] for r in sample]
             if table_exists(conn, cfg.schema, task["table"]):
-                kinds = verify_existing_table(conn, cfg.schema, task["table"], header)
+                kinds = verify_existing_table(conn, cfg.schema, task["table"], selected)
                 log.info("Existing table %s.%s verified (append mode)", cfg.schema, task["table"])
             else:
-                kinds = infer_types(header, sample, st.schema_overrides)
-                create_table(conn, cfg.schema, task["table"], header, kinds)
+                kinds = infer_types(selected, sample_sel, st.schema_overrides)
+                create_table(conn, cfg.schema, task["table"], selected, kinds)
                 log.info("Created table %s.%s with types %s", cfg.schema, task["table"],
-                         dict(zip(header, kinds)))
-            set_job_schema(conn, meta, job_id, header, kinds)
+                         dict(zip(selected, kinds)))
+            log.info("Importing %d of %d columns", len(selected), len(header))
+            set_job_schema(conn, meta, job_id, header, selected, kinds)
             job = get_job(conn, meta, job_id)
-    ref, kinds = job["header"], job["col_types"]
+    ref, info = job["header"], job["col_types"]
+    if isinstance(info, list):                # jobs created by older versions
+        selected, kinds = ref, info
+    else:
+        selected, kinds = info["selected"], info["kinds"]
     compare_headers(ref, header, sheet)
-    log.info("Worksheet '%s': header validated (%d columns)", sheet, len(header))
+    log.info("Worksheet '%s': header validated (%d columns, %d imported)", sheet, len(header),
+             len(selected))
+    indices = None if selected == header else [header.index(c) for c in selected]
 
     set_sheet_status(conn, meta, job_id, sheet, "validated")
     barrier = task.get("barrier") or []
@@ -127,9 +148,9 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
 
     used = conn.execute(f"SELECT count(*) FROM {meta.issues} WHERE job_id = %s AND sheet_name = %s",
                         (job_id, sheet)).fetchone()[0]
-    loader = BatchLoader(cfg, meta, job, header, kinds, log, max(st.max_issue_rows - used, 0))
+    loader = BatchLoader(cfg, meta, job, selected, kinds, log, max(st.max_issue_rows - used, 0))
     try:
-        _import_rows(loader, task, st, RowConverter(header, kinds), rows, start_row,
+        _import_rows(loader, task, st, RowConverter(selected, kinds, indices, len(header)), rows, start_row,
                      resume_last, me["rejected"], log)
     finally:
         loader.close()

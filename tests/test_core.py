@@ -126,3 +126,10 @@ def test_resume_refused_when_source_changed(db, tmp_path):
     with pytest.raises(FatalError, match="CHANGED"):
         run_import(cfg, ImportSettings(), None, None, Console(quiet=True),
                    resume_job_id=rep["job_id"])
+
+
+def test_column_projection_and_duplicate_header_names():
+    conv = RowConverter(["id", "amount"], ["TEXT", "NUMERIC"], indices=[0, 2], full_width=4)
+    assert conv.convert(["A1", "skipped", 5, "skipped"]) == ["A1", 5]
+    assert conv.convert(["A2", "x", 6]) == ["A2", 6]          # short row padded, then projected
+    assert normalize_header(["id", "V", "V", "W"]) == ["id", "V_first", "V_second", "W"]

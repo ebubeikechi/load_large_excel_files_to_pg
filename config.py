@@ -56,6 +56,7 @@ class ImportSettings:
     max_issue_rows: int = 100_000     # cap on stored issue detail rows per worksheet
     engine: str = "calamine"          # calamine (fast) | openpyxl (lowest memory)
     schema_overrides: dict = field(default_factory=dict)
+    selected_columns: list | None = None   # None = import every column
 
     @classmethod
     def from_env(cls) -> "ImportSettings":

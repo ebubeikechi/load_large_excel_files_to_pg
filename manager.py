@@ -101,6 +101,7 @@ def run_import(db_cfg: DbConfig, st: ImportSettings, file_path: str, table: str 
         path, job = _prepare_resume(conn, meta, resume_job_id, file_path, console)
         table = job["table_name"]
         st.batch_size = job["batch_size"] or st.batch_size
+        st.selected_columns = (job["settings"] or {}).get("selected_columns")
         resumed = True
     else:
         path = Path(file_path).expanduser().resolve()

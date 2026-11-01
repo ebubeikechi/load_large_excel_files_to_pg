@@ -97,9 +97,11 @@ def touch_job(conn, meta: Meta, job_id: str) -> None:
     conn.execute(f"UPDATE {meta.jobs} SET updated_at = now() WHERE job_id = %s", (job_id,))
 
 
-def set_job_schema(conn, meta: Meta, job_id: str, header: list[str], kinds: list[str]) -> None:
+def set_job_schema(conn, meta: Meta, job_id: str, header: list[str], selected: list[str],
+                   kinds: list[str]) -> None:
+    """header = full reference header (for validation); selected/kinds = imported columns."""
     conn.execute(f"UPDATE {meta.jobs} SET header = %s, col_types = %s WHERE job_id = %s",
-                 (Jsonb(header), Jsonb(kinds), job_id))
+                 (Jsonb(header), Jsonb({"selected": selected, "kinds": kinds}), job_id))
 
 
 def set_sheet_status(conn, meta: Meta, job_id: str, sheet: str, status: str,

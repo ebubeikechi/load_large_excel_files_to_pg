@@ -98,6 +98,35 @@ def cmd_import(args) -> int:
     for i, f in enumerate(files, 1):
         console.print(f"  {i}. {Path(f).name}  ({fmt_size(Path(f).stat().st_size)})")
 
+    st.selected_columns = None
+    if args.columns:
+        st.selected_columns = [c.strip() for c in args.columns.split(",") if c.strip()]
+    elif not args.all_columns:
+        from column_picker import pick_columns
+        from excel_reader import get_columns
+        try:
+            with console.status(f"Reading column names from {Path(files[0]).name} ..."):
+                cols = get_columns(files[0], st.engine)
+        except FatalError as e:
+            console.print(f"[bold red]Could not read the header:[/] {e}")
+            return 2
+        chosen = pick_columns(cols, console)
+        if chosen is None:
+            console.print("[yellow]Cancelled - nothing was imported.[/]")
+            return 2
+        if len(chosen) < len(cols):
+            st.selected_columns = chosen
+    if st.selected_columns:
+        from excel_reader import get_columns
+        console.print(f"[bold]Columns selected:[/] {len(st.selected_columns)} "
+                      f"(first column = primary key is always included)")
+        for f in files[1:]:                     # instant pre-check of the other workbooks
+            hdr = get_columns(f, st.engine, fast_only=True)
+            miss = [c for c in st.selected_columns if hdr is not None and c not in hdr]
+            if miss:
+                console.print(f"[yellow]Warning:[/] {Path(f).name} lacks selected column(s) "
+                               f"{miss[:5]} - that file will fail validation.")
+
     outcomes = []
     for i, f in enumerate(files, 1):
         table = args.table or default_table_name(f)
@@ -258,6 +287,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file", "-f", nargs="+", help="workbook path(s) / wildcards; omit to open a file picker")
     sp.add_argument("--table", "-t", help="destination table (default: derived from file name)")
     sp.add_argument("--stop-on-error", action="store_true", help="stop the queue if a file fails")
+    sp.add_argument("--columns", help="comma-separated column names to import (skips the popup)")
+    sp.add_argument("--all-columns", action="store_true", help="import every column (skips the popup)")
     common(sp); tuning(sp); sp.set_defaults(fn=cmd_import)
 
     sp = sub.add_parser("resume", help="resume an interrupted job")

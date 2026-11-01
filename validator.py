@@ -148,10 +148,14 @@ def _id_wrapper(conv):
 
 
 class RowConverter:
-    """Validates + converts one source row into a list ready for COPY."""
+    """Validates + converts one source row into a list ready for COPY.
+    header/kinds describe the IMPORTED columns; indices (if given) are their positions in the
+    full source row and full_width is the number of columns in the source header."""
 
-    def __init__(self, header: list[str], kinds: list[str]):
-        self.header, self.kinds, self.ncols = header, kinds, len(header)
+    def __init__(self, header: list[str], kinds: list[str], indices: list[int] | None = None,
+                 full_width: int | None = None):
+        self.header, self.kinds, self.indices = header, kinds, indices
+        self.ncols = full_width or len(header)
         self.convs = [CONVERTERS[k] for k in kinds]
         self.convs[0] = _id_wrapper(self.convs[0])
 
@@ -166,6 +170,8 @@ class RowConverter:
                 row = row[:ncols]
             else:
                 row = list(row) + [None] * (ncols - n)
+        if self.indices is not None:
+            row = [row[i] for i in self.indices]
         try:
             return [c(v) for c, v in zip(self.convs, row)]
         except Exception:
