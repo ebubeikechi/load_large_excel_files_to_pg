@@ -98,10 +98,12 @@ def touch_job(conn, meta: Meta, job_id: str) -> None:
 
 
 def set_job_schema(conn, meta: Meta, job_id: str, header: list[str], selected: list[str],
-                   kinds: list[str]) -> None:
-    """header = full reference header (for validation); selected/kinds = imported columns."""
+                   kinds: list[str], pk_cols: list[str], pk_name: str, sep: str) -> None:
+    """header = full reference header (validation); selected = imported source columns;
+    kinds = types of the TABLE columns (selected + combined key column, if any)."""
+    info = {"selected": selected, "kinds": kinds, "pk": pk_cols, "pk_name": pk_name, "sep": sep}
     conn.execute(f"UPDATE {meta.jobs} SET header = %s, col_types = %s WHERE job_id = %s",
-                 (Jsonb(header), Jsonb({"selected": selected, "kinds": kinds}), job_id))
+                 (Jsonb(header), Jsonb(info), job_id))
 
 
 def set_sheet_status(conn, meta: Meta, job_id: str, sheet: str, status: str,

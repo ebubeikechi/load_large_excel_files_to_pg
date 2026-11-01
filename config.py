@@ -57,6 +57,8 @@ class ImportSettings:
     engine: str = "calamine"          # calamine (fast) | openpyxl (lowest memory)
     schema_overrides: dict = field(default_factory=dict)
     selected_columns: list | None = None   # None = import every column
+    pk_columns: list | None = None         # None = first column; several = concatenated key
+    pk_separator: str = "|"                # joins values of a composite primary key
 
     @classmethod
     def from_env(cls) -> "ImportSettings":

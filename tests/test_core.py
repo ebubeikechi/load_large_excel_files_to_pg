@@ -133,3 +133,26 @@ def test_column_projection_and_duplicate_header_names():
     assert conv.convert(["A1", "skipped", 5, "skipped"]) == ["A1", 5]
     assert conv.convert(["A2", "x", 6]) == ["A2", 6]          # short row padded, then projected
     assert normalize_header(["id", "V", "V", "W"]) == ["id", "V_first", "V_second", "W"]
+
+
+def test_composite_primary_key_converter():
+    from validator import pk_column_name
+    conv = RowConverter(["BRANCH", "N", "RRN"], ["TEXT", "NUMERIC", "TEXT"], pk=["RRN", "BRANCH"])
+    vals = conv.convert(["B1", 5, "R9"])
+    assert vals == ["B1", 5, "R9", "R9|B1"] and conv.key_index == 3     # order = pk order
+    assert pk_column_name(["RRN", "BRANCH"]) == "RRN_BRANCH"
+    with pytest.raises(RowError):
+        conv.convert([None, 5, "R9"])                                    # missing key part
+
+
+def test_composite_pk_import_end_to_end(db, tmp_path):
+    cfg, conn, tables = db
+    t = "t_" + uuid.uuid4().hex[:8]
+    tables.append(t)
+    make_book(tmp_path / "c.xlsx", {"S": [["BR", "RRN", "AMT"], ["A", "1", 5], ["A", "2", 6],
+                                          ["B", "1", 7], ["A", "1", 8]]})
+    rep = run(cfg, tmp_path / "c.xlsx", t, pk_columns=["BR", "RRN"])
+    assert rep["inserted"] == 3 and rep["duplicates_skipped"] == 1
+    assert rep["primary_key"]["column_name"] == "BR_RRN"
+    keys = {r[0] for r in conn.execute(f'SELECT "BR_RRN" FROM "{t}"').fetchall()}
+    assert keys == {"A|1", "A|2", "B|1"}

@@ -142,22 +142,31 @@ CONVERTERS = {"TEXT": _text, "NUMERIC": _numeric, "BIGINT": _bigint, "DATE": _da
 def _id_wrapper(conv):
     def wrapped(v):
         if v is None or (v.__class__ is str and not v.strip()):
-            raise ValueError("missing id")
+            raise ValueError("missing primary key value")
         return conv(v)
     return wrapped
 
 
 class RowConverter:
-    """Validates + converts one source row into a list ready for COPY.
-    header/kinds describe the IMPORTED columns; indices (if given) are their positions in the
-    full source row and full_width is the number of columns in the source header."""
+    """Validates + converts one source row into a list aligned with the TABLE columns:
+    the imported (selected) columns, plus - for a composite primary key - one extra combined
+    key column holding the pk values joined by `sep` in pk order.
+    header/kinds: imported columns. indices: their positions in the full source row.
+    full_width: number of columns in the source header. pk: primary-key column names."""
 
     def __init__(self, header: list[str], kinds: list[str], indices: list[int] | None = None,
-                 full_width: int | None = None):
-        self.header, self.kinds, self.indices = header, kinds, indices
+                 full_width: int | None = None, pk: list[str] | None = None, sep: str = "|"):
+        self.header, self.kinds, self.indices, self.sep = header, kinds, indices, sep
         self.ncols = full_width or len(header)
         self.convs = [CONVERTERS[k] for k in kinds]
-        self.convs[0] = _id_wrapper(self.convs[0])
+        pk = pk or [header[0]]
+        self.pk_pos = [header.index(c) for c in pk]
+        self.combined = len(pk) > 1
+        if self.combined:
+            self.key_index = len(header)          # the appended combined column
+        else:
+            self.key_index = self.pk_pos[0]
+            self.convs[self.key_index] = _id_wrapper(self.convs[self.key_index])
 
     def convert(self, row) -> list:
         n = len(row)
@@ -173,9 +182,30 @@ class RowConverter:
         if self.indices is not None:
             row = [row[i] for i in self.indices]
         try:
-            return [c(v) for c, v in zip(self.convs, row)]
+            vals = [c(v) for c, v in zip(self.convs, row)]
         except Exception:
             raise RowError(self._diagnose(row)) from None
+        if self.combined:
+            parts = []
+            for i in self.pk_pos:
+                try:
+                    p = _text(row[i])
+                except ValueError:
+                    raise RowError(f"primary key column '{self.header[i]}': contains NUL "
+                                   f"character") from None
+                if p is None or not p.strip():
+                    raise RowError(f"missing primary key part '{self.header[i]}'")
+                parts.append(p)
+            vals.append(self.sep.join(parts))
+        return vals
+
+    def id_text(self, row) -> str | None:
+        """Best-effort identifier of a source row (for issue logs); never raises."""
+        try:
+            pos = [self.indices[i] for i in self.pk_pos] if self.indices is not None else self.pk_pos
+            return self.sep.join("" if row[p] is None else str(row[p]) for p in pos)[:200]
+        except Exception:
+            return None
 
     def _diagnose(self, row) -> str:
         for i, (c, v) in enumerate(zip(self.convs, row)):
@@ -250,3 +280,22 @@ def compare_headers(ref: list[str], header: list[str], sheet: str) -> None:
     else:
         detail = f"missing={missing} extra={extra}"
     raise FatalError(f"Worksheet '{sheet}' header differs from the reference header: {detail}")
+
+
+def pk_column_name(pk_cols: list[str]) -> str:
+    """Single pk -> that column. Several -> names joined by '_' in concatenation order."""
+    return pk_cols[0] if len(pk_cols) == 1 else "_".join(pk_cols)
+
+
+def validate_pk_name(pk_cols: list[str], header: list[str]) -> str:
+    name = pk_column_name(pk_cols)
+    if len(pk_cols) > 1:
+        if name in header:
+            raise FatalError(f"The combined primary key column name '{name}' collides with an "
+                             f"existing column.")
+        if len(name.encode("utf-8")) > 63:
+            raise FatalError(f"The combined primary key column name is {len(name.encode('utf-8'))}"
+                             f" bytes (PostgreSQL max 63). Choose fewer or shorter key columns.")
+        if name.lower() in METADATA_COLUMNS:
+            raise FatalError(f"'{name}' is a reserved metadata column name.")
+    return name

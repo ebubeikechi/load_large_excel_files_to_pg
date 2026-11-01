@@ -17,13 +17,14 @@ class BatchLoader:
     all in ONE transaction per batch. Reconnects and retries on connection loss; the
     checkpoint guard makes a retry after an unacknowledged commit harmless."""
 
-    def __init__(self, db_cfg, meta: Meta, job: dict, header, kinds, log, issue_budget: int):
+    def __init__(self, db_cfg, meta: Meta, job: dict, header, kinds, log, issue_budget: int,
+                 pk_name: str | None = None):
         self.cfg, self.meta, self.log = db_cfg, meta, log
         self.job_id, self.job_ts = job["job_id"], job["imported_at"]
         self.budget = issue_budget
         ident = sql.Identifier
         cols = sql.SQL(", ").join(ident(h) for h in header)
-        idc = ident(header[0])
+        idc = ident(pk_name or header[0])
         dest = ident(db_cfg.schema, job["table_name"])
         self.q_stage = sql.SQL("CREATE TEMP TABLE IF NOT EXISTS _stage ({defs}, _rn BIGINT) "
                                "ON COMMIT DELETE ROWS").format(

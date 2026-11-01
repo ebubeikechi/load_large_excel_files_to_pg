@@ -32,7 +32,9 @@ def looks_like_identifier(name: str) -> bool:
     return bool(tokens) and tokens[-1] in ID_TOKENS
 
 
-def infer_types(header: list[str], sample_rows, overrides: dict | None = None) -> list[str]:
+def infer_types(header: list[str], sample_rows, overrides: dict | None = None,
+                text_cols: set | None = None) -> list[str]:
+    text_cols = {header[0]} if text_cols is None else text_cols
     n = len(header)
     seen = [set() for _ in range(n)]
     has_time = [False] * n
@@ -48,8 +50,8 @@ def infer_types(header: list[str], sample_rows, overrides: dict | None = None) -
     kinds = []
     for i, name in enumerate(header):
         ts = seen[i]
-        if i == 0 or not ts:
-            k = "TEXT"                                   # id is always preserved as TEXT
+        if name in text_cols or not ts:
+            k = "TEXT"                                   # single pk is preserved as TEXT
         elif ts <= {bool}:
             k = "BOOLEAN"
         elif ts <= {int, float}:
@@ -79,20 +81,24 @@ def table_exists(conn, schema: str, table: str) -> bool:
     return row is not None
 
 
-def create_table(conn, schema: str, table: str, header: list[str], kinds: list[str]) -> None:
+def create_table(conn, schema: str, table: str, header: list[str], kinds: list[str],
+                 pk_name: str | None = None) -> None:
+    pk_name = pk_name or header[0]
     cols = [sql.SQL("{} {}{}").format(sql.Identifier(h), sql.SQL(k),
-                                      sql.SQL(" NOT NULL" if i == 0 else ""))
+                                      sql.SQL(" NOT NULL" if h == pk_name else ""))
             for i, (h, k) in enumerate(zip(header, kinds))]
     stmt = sql.SQL("CREATE TABLE {tbl} ({cols}, source_sheet TEXT NOT NULL, "
                    "imported_at TIMESTAMPTZ NOT NULL, PRIMARY KEY ({id}))").format(
         tbl=sql.Identifier(schema, table), cols=sql.SQL(", ").join(cols),
-        id=sql.Identifier(header[0]))
+        id=sql.Identifier(pk_name))
     if schema != "public":
         conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
     conn.execute(stmt)  # plain CREATE (never IF NOT EXISTS / DROP): cannot clobber a table
 
 
-def verify_existing_table(conn, schema: str, table: str, header: list[str]) -> list[str]:
+def verify_existing_table(conn, schema: str, table: str, header: list[str],
+                          pk_name: str | None = None) -> list[str]:
+    pk_name = pk_name or header[0]
     """Check an existing destination table is compatible; return column kinds from it."""
     rows = conn.execute(
         "SELECT column_name, data_type, is_nullable, column_default "
@@ -111,9 +117,9 @@ def verify_existing_table(conn, schema: str, table: str, header: list[str]) -> l
         "SELECT 1 FROM pg_index i WHERE i.indrelid = %s::regclass AND i.indisunique "
         "AND i.indpred IS NULL AND i.indnatts = 1 AND i.indkey[0] = "
         "(SELECT attnum FROM pg_attribute WHERE attrelid = i.indrelid AND attname = %s)",
-        (qualified, header[0])).fetchone()
+        (qualified, pk_name)).fetchone()
     if not ok:
-        raise FatalError(f"Column '{header[0]}' of {schema}.{table} has no PRIMARY KEY/UNIQUE "
+        raise FatalError(f"Column '{pk_name}' of {schema}.{table} has no PRIMARY KEY/UNIQUE "
                          f"constraint; refusing to import (duplicates could not be prevented).")
     kinds = []
     for h in header:

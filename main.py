@@ -98,34 +98,46 @@ def cmd_import(args) -> int:
     for i, f in enumerate(files, 1):
         console.print(f"  {i}. {Path(f).name}  ({fmt_size(Path(f).stat().st_size)})")
 
+    from excel_reader import get_columns
     st.selected_columns = None
+    if args.pk_separator:
+        st.pk_separator = args.pk_separator
+    if args.pk:
+        st.pk_columns = [c.strip() for c in args.pk.split(",") if c.strip()]
     if args.columns:
         st.selected_columns = [c.strip() for c in args.columns.split(",") if c.strip()]
-    elif not args.all_columns:
+    elif not args.all_columns and not args.pk:
         from column_picker import pick_columns
-        from excel_reader import get_columns
         try:
             with console.status(f"Reading column names from {Path(files[0]).name} ..."):
                 cols = get_columns(files[0], st.engine)
         except FatalError as e:
             console.print(f"[bold red]Could not read the header:[/] {e}")
             return 2
-        chosen = pick_columns(cols, console)
-        if chosen is None:
+        picked = pick_columns(cols, console, st.pk_separator)
+        if picked is None:
             console.print("[yellow]Cancelled - nothing was imported.[/]")
             return 2
+        chosen, pk = picked
         if len(chosen) < len(cols):
             st.selected_columns = chosen
+        if pk != [cols[0]]:
+            st.pk_columns = pk
     if st.selected_columns:
-        from excel_reader import get_columns
-        console.print(f"[bold]Columns selected:[/] {len(st.selected_columns)} "
-                      f"(first column = primary key is always included)")
+        console.print(f"[bold]Columns selected:[/] {len(st.selected_columns)}")
+    if st.pk_columns and len(st.pk_columns) > 1:
+        console.print(f"[bold]Primary key (composite):[/] {' + '.join(st.pk_columns)} -> column "
+                      f"'{'_'.join(st.pk_columns)}' (values joined with '{st.pk_separator}')")
+    else:
+        console.print(f"[bold]Primary key:[/] {(st.pk_columns or ['first column'])[0]}")
+    need = (st.selected_columns or []) + (st.pk_columns or [])
+    if need:
         for f in files[1:]:                     # instant pre-check of the other workbooks
             hdr = get_columns(f, st.engine, fast_only=True)
-            miss = [c for c in st.selected_columns if hdr is not None and c not in hdr]
+            miss = [c for c in need if hdr is not None and c not in hdr]
             if miss:
-                console.print(f"[yellow]Warning:[/] {Path(f).name} lacks selected column(s) "
-                               f"{miss[:5]} - that file will fail validation.")
+                console.print(f"[yellow]Warning:[/] {Path(f).name} lacks column(s) "
+                              f"{miss[:5]} - that file will fail validation.")
 
     outcomes = []
     for i, f in enumerate(files, 1):
@@ -289,6 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stop-on-error", action="store_true", help="stop the queue if a file fails")
     sp.add_argument("--columns", help="comma-separated column names to import (skips the popup)")
     sp.add_argument("--all-columns", action="store_true", help="import every column (skips the popup)")
+    sp.add_argument("--pk", help="primary key column(s), comma-separated; several are concatenated in this order")
+    sp.add_argument("--pk-separator", help="separator for a composite key (default |)")
     common(sp); tuning(sp); sp.set_defaults(fn=cmd_import)
 
     sp = sub.add_parser("resume", help="resume an interrupted job")

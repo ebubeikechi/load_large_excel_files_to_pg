@@ -13,7 +13,7 @@ from loader import BatchLoader
 from logger import get_logger
 from schema import create_table, infer_types, table_exists, verify_existing_table
 from validator import (EMPTY, RowConverter, RowError, compare_headers, normalize_header,
-                       row_id_text, validate_header_names)
+                       pk_column_name, validate_header_names, validate_pk_name)
 
 ABORT_JOB_STATES = ("failed", "interrupted")
 
@@ -52,15 +52,16 @@ def _mark_failed(cfg, task, msg):
         pass
 
 
-def _resolve_selection(header: list[str], wanted) -> list[str]:
-    """Selected column names in header order; the first column (primary key) is always kept."""
-    if not wanted:
-        return list(header)
-    missing = [c for c in wanted if c not in header]
-    if missing:
-        raise FatalError(f"Selected column(s) not found in the worksheet header: {missing[:5]}")
-    keep = set(wanted) | {header[0]}
-    return [h for h in header if h in keep]
+def _resolve_selection(header: list[str], wanted, pk) -> tuple[list[str], list[str]]:
+    """-> (imported columns in header order, primary-key columns in concatenation order)."""
+    pk_cols = list(pk) if pk else [header[0]]
+    bad = [c for c in list(wanted or []) + pk_cols if c not in header]
+    if bad:
+        raise FatalError(f"Selected column(s) not found in the worksheet header: {bad[:5]}")
+    if len(set(pk_cols)) != len(pk_cols):
+        raise FatalError("The same column was chosen twice as primary key.")
+    keep = (set(wanted) | set(pk_cols)) if wanted else set(header)
+    return [h for h in header if h in keep], pk_cols
 
 
 def _wait(conn, meta, job_id, predicate, sleep=0.5):
@@ -102,25 +103,40 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
             job = _wait(conn, meta, job_id, lambda j, s: j["header"] is not None)
         else:
             sample = list(islice(stream.rows, st.sample_rows))
-            selected = _resolve_selection(header, st.selected_columns)
+            selected, pk_cols = _resolve_selection(header, st.selected_columns, st.pk_columns)
+            pk_name = validate_pk_name(pk_cols, header)
+            combined = len(pk_cols) > 1
+            table_cols = selected + ([pk_name] if combined else [])
             pos = [header.index(c) for c in selected]
             sample_sel = [[r[i] if i < len(r) else None for i in pos] for r in sample]
             if table_exists(conn, cfg.schema, task["table"]):
-                kinds = verify_existing_table(conn, cfg.schema, task["table"], selected)
+                kinds_full = verify_existing_table(conn, cfg.schema, task["table"], table_cols,
+                                                   pk_name)
                 log.info("Existing table %s.%s verified (append mode)", cfg.schema, task["table"])
             else:
-                kinds = infer_types(selected, sample_sel, st.schema_overrides)
-                create_table(conn, cfg.schema, task["table"], selected, kinds)
+                kinds_sel = infer_types(selected, sample_sel, st.schema_overrides,
+                                        set() if combined else {pk_cols[0]})
+                kinds_full = kinds_sel + (["TEXT"] if combined else [])
+                create_table(conn, cfg.schema, task["table"], table_cols, kinds_full, pk_name)
                 log.info("Created table %s.%s with types %s", cfg.schema, task["table"],
-                         dict(zip(selected, kinds)))
-            log.info("Importing %d of %d columns", len(selected), len(header))
-            set_job_schema(conn, meta, job_id, header, selected, kinds)
+                         dict(zip(table_cols, kinds_full)))
+            log.info("Importing %d of %d columns; primary key column '%s' from %s (sep '%s')",
+                     len(selected), len(header), pk_name, pk_cols, st.pk_separator)
+            set_job_schema(conn, meta, job_id, header, selected, kinds_full, pk_cols, pk_name,
+                           st.pk_separator)
             job = get_job(conn, meta, job_id)
     ref, info = job["header"], job["col_types"]
     if isinstance(info, list):                # jobs created by older versions
-        selected, kinds = ref, info
+        selected, kinds_full = ref, info
+        pk_cols, sep = [ref[0]], "|"
     else:
-        selected, kinds = info["selected"], info["kinds"]
+        selected, kinds_full = info["selected"], info["kinds"]
+        pk_cols, sep = info.get("pk") or [selected[0]], info.get("sep", "|")
+    pk_name = info.get("pk_name") if isinstance(info, dict) and info.get("pk_name") \
+        else pk_column_name(pk_cols)
+    combined = len(pk_cols) > 1
+    table_cols = selected + ([pk_name] if combined else [])
+    kinds_sel = kinds_full[:len(selected)]
     compare_headers(ref, header, sheet)
     log.info("Worksheet '%s': header validated (%d columns, %d imported)", sheet, len(header),
              len(selected))
@@ -148,9 +164,10 @@ def _run(task, cfg, st, conn, meta, log) -> dict:
 
     used = conn.execute(f"SELECT count(*) FROM {meta.issues} WHERE job_id = %s AND sheet_name = %s",
                         (job_id, sheet)).fetchone()[0]
-    loader = BatchLoader(cfg, meta, job, selected, kinds, log, max(st.max_issue_rows - used, 0))
+    loader = BatchLoader(cfg, meta, job, table_cols, kinds_full, log,
+                         max(st.max_issue_rows - used, 0), pk_name)
     try:
-        _import_rows(loader, task, st, RowConverter(selected, kinds, indices, len(header)), rows, start_row,
+        _import_rows(loader, task, st, RowConverter(selected, kinds_sel, indices, len(header), pk_cols, sep), rows, start_row,
                      resume_last, me["rejected"], log)
     finally:
         loader.close()
@@ -204,11 +221,11 @@ def _import_rows(loader, task, st, conv, rows, start_row, prev_last, rejected_to
                 rejected += 1
                 if rejected <= 20:
                     log.warning("REJECT sheet='%s' row=%d id=%s reason=%s", sheet, row_num,
-                                row_id_text(row), e)
+                                conv.id_text(row), e)
                 if loader.take_budget():
-                    issues.append((job_id, sheet, row_num, row_id_text(row), "REJECTED", str(e)))
+                    issues.append((job_id, sheet, row_num, conv.id_text(row), "REJECTED", str(e)))
             else:
-                key = vals[0]
+                key = vals[conv.key_index]
                 first = seen.get(key)
                 if first is not None:
                     dup_batch += 1

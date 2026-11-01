@@ -101,7 +101,10 @@ def run_import(db_cfg: DbConfig, st: ImportSettings, file_path: str, table: str 
         path, job = _prepare_resume(conn, meta, resume_job_id, file_path, console)
         table = job["table_name"]
         st.batch_size = job["batch_size"] or st.batch_size
-        st.selected_columns = (job["settings"] or {}).get("selected_columns")
+        jset = job["settings"] or {}
+        st.selected_columns = jset.get("selected_columns")
+        st.pk_columns = jset.get("pk_columns")
+        st.pk_separator = jset.get("pk_separator", "|")
         resumed = True
     else:
         path = Path(file_path).expanduser().resolve()
@@ -200,6 +203,10 @@ def _finalize(conn, meta, db_cfg, job, sheets, t_run, done_start, resumed, path,
     set_job_status(conn, meta, job_id, status, None if verified else
                    f"DB holds {db_count} rows for this job but counters say {inserted}", True)
     issues_file = _export_issues(conn, meta, job_id)
+    info = (get_job(conn, meta, job_id) or {}).get("col_types") or {}
+    pk_info = ({"columns": info.get("pk"), "column_name": info.get("pk_name"),
+                "separator": info.get("sep") if len(info.get("pk") or []) > 1 else None}
+               if isinstance(info, dict) else None)
     done_end = Dashboard.totals(sheets)[0]
     duration = time.time() - t_run
     rows_read = sum(s["rows_read"] for s in sheets)
@@ -216,7 +223,7 @@ def _finalize(conn, meta, db_cfg, job, sheets, t_run, done_start, resumed, path,
         "duplicates_within_workbook": sum(s["dup_workbook"] for s in sheets),
         "rejected": sum(s["rejected"] for s in sheets),
         "blank_rows_skipped": sum(s["blank"] for s in sheets),
-        "verified_rows_in_database": db_count, "verification_passed": verified,
+        "primary_key": pk_info, "verified_rows_in_database": db_count, "verification_passed": verified,
         "start_time": job["started_at"].isoformat(), "completion_time": now().isoformat(),
         "duration_seconds": round(duration, 2),
         "average_rows_per_second": round((done_end - done_start) / duration, 1) if duration else 0,
@@ -264,6 +271,8 @@ def print_summary(console, r: dict, rpath) -> None:
     t.add_row("Rejected", f"{r['rejected']:,}")
     t.add_row("Blank rows skipped", f"{r['blank_rows_skipped']:,}")
     t.add_row("Verified in database", f"{r['verified_rows_in_database']:,}")
+    if r.get("primary_key") and r["primary_key"].get("column_name"):
+        t.add_row("Primary key", r["primary_key"]["column_name"])
     t.add_row("Destination", r["destination_table"])
     t.add_row("Duration", fmt_duration(r["duration_seconds"]))
     t.add_row("Average speed", f"{r['average_rows_per_second']:,.0f} rows/sec")
