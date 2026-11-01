@@ -1,0 +1,6 @@
+python-calamine>=0.3.1
+psycopg[binary]>=3.1.18
+rich>=13.7
+python-dotenv>=1.0
+openpyxl>=3.1      # optional fallback engine + test workbook generation
+pytest>=8.0

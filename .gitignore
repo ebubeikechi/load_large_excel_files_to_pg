@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type-checker and linter caches
+.mypy_cache/
+.dmypy.json
+.pyre/
+.ruff_cache/
+
+# Generated application output
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Local Excel/data files
+*.xlsx
+*.xlsm
+*.xls
+*.xlsb
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
